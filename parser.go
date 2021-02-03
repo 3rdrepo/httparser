@@ -3,6 +3,8 @@ package httparser
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"net/url"
 	"strconv"
 	"unicode"
 )
@@ -31,6 +33,14 @@ var (
 	maxHeaderSize    int32 = 4096 //默认http header单行最大限制为4k
 )
 
+// Request .
+type Request struct {
+	Status  string
+	URL     *url.URL
+	Headers map[string]string
+	Body    []byte
+}
+
 // http 1.1 or http 1.0解析器
 type Parser struct {
 	currState           state       //记录当前状态
@@ -42,6 +52,10 @@ type Parser struct {
 	StatusCode          uint16      //状态码
 	hasContentLength    bool        //设置Content-Length头部
 	hasTransferEncoding bool        //transferEncoding头部
+
+	buffer      []byte
+	request     *Request
+	headerField string
 }
 
 // 解析器构造函数
@@ -99,11 +113,20 @@ func (p *Parser) Init(t ReqOrRsp) {
 // 设计思路修改
 // 为了适应流量解析的场景，状态机的状态会更碎一点
 
-func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) {
-	currState := p.currState
+func (p *Parser) Read(buf []byte) {
+	p.buffer = append(p.buffer, buf...)
+}
 
-	chunkDataStartIndex := 0
-	urlStartIndex := 0
+func (p *Parser) Execute(setting *Setting) (*Request, bool, error) {
+	var (
+		err                 error
+		currState           = p.currState
+		chunkDataStartIndex = 0
+		urlStartIndex       = 0
+	)
+
+	// for j := 0; j < len(p.buffers); j++ {
+	buf := p.buffer
 
 	i := 0
 	c := byte(0)
@@ -118,6 +141,9 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 				if setting.MessageBegin != nil {
 					setting.MessageBegin()
 				}
+				if p.request == nil {
+					p.request = &Request{}
+				}
 				currState = rspHTTP
 				continue
 			}
@@ -125,12 +151,15 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 			fallthrough
 		case startReq:
 			if token[c] == 0 {
-				return 0, ErrReqMethod
+				return nil, false, ErrReqMethod
 			}
 
 			currState = reqMethod
 			if setting.MessageBegin != nil {
 				setting.MessageBegin()
+			}
+			if p.request == nil {
+				p.request = &Request{}
 			}
 
 		case reqMethod:
@@ -140,7 +169,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 					continue
 				}
 
-				return i, ErrReqMethod
+				return nil, false, ErrReqMethod
 			}
 
 			// 维持reqMethod状态不变
@@ -156,6 +185,10 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 				if setting.URL != nil {
 					setting.URL(buf[urlStartIndex:i])
 				}
+				p.request.URL, err = url.Parse(string(buf[urlStartIndex:i]))
+				if err != nil {
+					return nil, false, err
+				}
 			}
 
 		case reqURLAfterSP:
@@ -169,14 +202,14 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 
 		case reqRequestLineAlomstDone:
 			if c != '\n' {
-				return 0, ErrRequestLineCRLF
+				return nil, false, ErrRequestLineCRLF
 			}
 
 			currState = headerField
 
 		case startRsp:
 			if c != 'H' {
-				return 0, ErrHTTPVersion
+				return nil, false, ErrHTTPVersion
 			}
 
 			if setting.MessageBegin != nil {
@@ -187,11 +220,11 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 
 		case rspHTTP:
 			if len(buf[i:]) < len(strTTPslash) {
-				return 0, ErrHTTPVersion
+				return nil, false, ErrHTTPVersion
 			}
 
 			if !bytes.Equal(buf[i:len(strTTPslash)+1], strTTPslash) {
-				return 0, ErrHTTPVersion
+				return nil, false, ErrHTTPVersion
 			}
 
 			i += len(strTTPslash) - 1
@@ -200,7 +233,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 		case rspHTTPVersionNum:
 			// 1.1 or 1.0 or 0.9
 			if len(buf[i:]) < 3 || !unicode.IsNumber(rune(buf[i])) || !unicode.IsNumber(rune(buf[i+2])) {
-				return 0, ErrHTTPVersionNum
+				return nil, false, ErrHTTPVersionNum
 			}
 
 			p.major = buf[i] - '0'
@@ -217,7 +250,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 			}
 
 			if i >= len(buf) {
-				return 0, ErrHTTPStatus
+				return nil, false, ErrHTTPStatus
 			}
 
 			currState = rspStatus
@@ -234,7 +267,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 			}
 
 			if end >= len(buf) || end+1 >= len(buf) {
-				return 0, ErrRspStatusLine
+				return nil, false, ErrRspStatusLine
 			}
 
 			//TODO单独状态
@@ -248,6 +281,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 			if setting.Status != nil {
 				setting.Status(buf[start:end])
 			}
+			p.request.Status = string(buf[start:end])
 
 			currState = headerField
 
@@ -260,17 +294,18 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 			pos := bytes.IndexByte(buf[i:], ':')
 			if pos == -1 {
 				if int32(len(buf[i:])) > p.maxHeaderSize {
-					return 0, ErrHeaderOverflow
+					return nil, false, ErrHeaderOverflow
 				}
 
 				p.currState = headerField
-				return i, nil
+				return nil, false, nil
 			}
 
 			field := buf[i : i+pos]
 			if setting.HeaderField != nil {
 				setting.HeaderField(field)
 			}
+			p.headerField = string(field)
 
 			c2 := c | 0x20
 			if c2 == 'c' || c2 == 't' {
@@ -302,21 +337,25 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 			end := bytes.IndexAny(buf[i:], "\r\n")
 			if end == -1 {
 				if int32(len(buf[i:])) > p.maxHeaderSize {
-					return 0, ErrHeaderOverflow
+					return nil, false, ErrHeaderOverflow
 				}
 				p.currState = headerValueDiscardWs
-				return i, nil
+				return nil, false, nil
 			}
 
 			if setting.HeaderValue != nil {
 				setting.HeaderValue(buf[i : i+end])
 			}
+			if p.request.Headers == nil {
+				p.request.Headers = map[string]string{}
+			}
+			p.request.Headers[p.headerField] = string(buf[i : i+end])
 
 			switch p.headerCurrState {
 			case hContentLength:
 				n, err := strconv.Atoi(BytesToString(buf[i : i+end]))
 				if err != nil {
-					return i, err
+					return nil, false, err
 				}
 
 				p.contentLength = int32(n)
@@ -356,7 +395,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 
 		case headerDone:
 			if c != '\n' {
-				return i, ErrNoEndLF
+				return nil, false, ErrNoEndLF
 			}
 
 			if setting.HeadersComplete != nil {
@@ -369,8 +408,12 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 				if p.contentLength == 0 {
 					if setting.MessageComplete != nil {
 						setting.MessageComplete()
-						return i, nil
 					}
+					p.buffer = p.buffer[i+1:]
+					r := p.request
+					p.request = nil
+					p.Reset()
+					return r, true, nil
 				}
 				currState = httpBody
 				continue
@@ -386,6 +429,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 				if setting.Body != nil && nread > 0 {
 					setting.Body(buf[i : int32(i)+nread])
 				}
+				p.request.Body = buf[i : int32(i)+nread]
 
 				p.contentLength -= nread
 
@@ -399,7 +443,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 		case chunkedSizeStart:
 			l := unhex[c]
 			if l == -1 {
-				return 0, ErrChunkSize
+				return nil, false, ErrChunkSize
 			}
 
 			p.contentLength = int32(l)
@@ -418,7 +462,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 					continue
 				}
 
-				return 0, ErrChunkSize
+				return nil, false, ErrChunkSize
 			}
 
 			p.contentLength = p.contentLength*16 + int32(l)
@@ -433,14 +477,20 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 			if p.contentLength == 0 {
 
 				//fmt.Printf("--->%d:%x:(%s)\n", buf[i], buf[i], buf[i:])
-				//return 0, ErrTrailerPart
+				// return nil, false, ErrTrailerPart
 
 				if setting.MessageComplete != nil {
 					setting.MessageComplete()
 				}
 				currState = messageDone
 
-				continue
+				p.buffer = p.buffer[i+1:]
+				r := p.request
+				p.request = nil
+				p.Reset()
+				return r, true, nil
+
+				// continue
 			}
 
 			chunkDataStartIndex = i + 1
@@ -451,6 +501,7 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 			if setting.Body != nil && nread > 0 {
 				setting.Body(buf[chunkDataStartIndex : int32(chunkDataStartIndex)+nread])
 			}
+			p.request.Body = buf[i : int32(i)+nread]
 
 			p.contentLength -= nread
 
@@ -477,10 +528,18 @@ func (p *Parser) Execute(setting *Setting, buf []byte) (success int, err error) 
 		}
 
 	}
-
+	// }
 	p.currState = currState
+	if currState == messageDone {
+		p.buffer = nil
+		r := p.request
+		p.request = nil
+		p.Reset()
+		return r, true, nil
+	}
 
-	return i, nil
+	fmt.Println("xxxxx")
+	return nil, false, nil
 }
 
 func (p *Parser) SetMaxHeaderSize(size int32) {
